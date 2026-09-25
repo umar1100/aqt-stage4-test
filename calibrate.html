@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Miss Aapa — scoring calibration (proof)</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { height:100%; overflow:hidden; }
+  body { font-family:-apple-system,system-ui,sans-serif; background:#fdf6ec; color:#4a3728;
+         display:flex; flex-direction:column; align-items:center; justify-content:center; }
+  #word { font-size:20vw; line-height:1; color:#0f766e; margin-bottom:2vh; }
+  #ring { width:30vw; height:30vw; max-width:180px; max-height:180px; border-radius:50%;
+          background:radial-gradient(circle at 35% 30%, #5eead4, #0d9488 70%);
+          display:flex; align-items:center; justify-content:center; font-size:14vw;
+          transition:box-shadow .2s; }
+  #ring.glow { box-shadow:0 0 0 6px #fbbf24, 0 0 44px 10px #fbbf24; animation:pulse 1.2s infinite; }
+  @keyframes pulse { 50% { box-shadow:0 0 0 10px #fbbf24, 0 0 60px 16px #fbbf24; } }
+  #status { margin-top:2.5vh; font-size:5vw; text-align:center; min-height:9vw; padding:0 6vw; }
+  #score { font-size:14vw; font-weight:700; color:#0d9488; min-height:16vw; }
+  .btn { font-size:5vw; padding:2.5vw 8vw; border-radius:999px; border:none; margin:1vh 1vw; }
+  #start { background:#0d9488; color:#fff; }
+  #next { background:#0d9488; color:#fff; display:none; }
+  #redo { background:#fff; color:#8a7a66; border:2px solid #d6c7b4; display:none; }
+  #copybtn { background:#fff; color:#8a7a66; border:2px solid #d6c7b4; display:none;
+             position:fixed; top:2vh; right:3vw; font-size:3.6vw; padding:1.5vw 3vw; }
+  #setup { display:flex; flex-direction:column; align-items:center; gap:2vh; }
+  #setup input { font-size:5vw; padding:2vw 4vw; border-radius:12px; border:2px solid #d6c7b4;
+                 width:70vw; text-align:center; }
+  #setup label { font-size:4.2vw; color:#8a7a66; }
+  #dbg { position:fixed; bottom:2vh; font-size:3.4vw; color:#a8a29e; text-align:center; width:100%; }
+</style>
+</head>
+<body>
+<div id="word">طيارة</div>
+<div id="setup">
+  <label>Speaker name (e.g. child-1)</label>
+  <input id="speaker" placeholder="child-1" maxlength="20">
+  <button class="btn" id="start">Start calibration</button>
+  <div style="font-size:4vw;color:#a8a29e;max-width:80vw;text-align:center;">
+    Block A: child says <b>طيارة</b> ×10.<br>Block B: child says <b>تفاحة</b> ×10.<br>
+    All scored against طيارة. Tap Redo on noise/bad takes.
+  </div>
+</div>
+<div id="ring" style="display:none;">🧕</div>
+<div id="status"></div>
+<div id="score"></div>
+<button class="btn" id="next">Next →</button>
+<button class="btn" id="redo">↺ Redo</button>
+<button id="copybtn">📋 Copy results</button>
+<div id="dbg"></div>
+<script>
+"use strict";
+// ---- config ----
+const RELAY = new URLSearchParams(location.search).get("relay")
+  || "https://aqt-relay-erdph4b2asewbegg.canadacentral-01.azurewebsites.net";
+const REF = "طيارة";
+const THRESH_DB = -28, GATE_FRAMES = 3, GATE_TICK_MS = 10;
+const END_SILENCE_MS = 800, LISTEN_TIMEOUT_MS = 25000, SCORE_TIMEOUT_MS = 25000;
+const BLOCKS = [
+  {say:"طيارة", n:10, kind:"positive"},
+  {say:"تفاحة", n:10, kind:"negative_contrast"},
+];
+// ---- state ----
+let AC=null, analyser=null, micStream=null, tbuf=null;
+let speaking=false, lastVoiceT=0, consecAbove=0;
+let mode="idle";            // idle|listen|scoring|result|done
+let blockIdx=0, trialInBlock=0, listenTimer=0, rec=null, chunks=[];
+let trials=[];              // {block, trial, say, kind, score, text, ms, error}
+let speaker="?", scoreCtrl=null;
+const $=id=>document.getElementById(id);
+const ring=$("ring"), statusEl=$("status"), scoreEl=$("score"), dbg=$("dbg");
+const t0=performance.now();
+const ua=(navigator.userAgent||"").slice(0,80);
+
+function setStatus(t){ statusEl.textContent=t; }
+function setDbg(t){ dbg.textContent=t; }
+function cur(){ return BLOCKS[blockIdx]; }
+function trialNo(){ return trials.filter(t=>!t.redone).length+1; }
+
+function dbfs(){
+  analyser.getFloatTimeDomainData(tbuf);
+  let s=0; for(let i=0;i<tbuf.length;i++) s+=tbuf[i]*tbuf[i];
+  const r=Math.sqrt(s/tbuf.length);
+  return r>0 ? 20*Math.log10(r) : -100;
+}
+function vadTick(){
+  if(mode!=="listen") return;
+  const db=dbfs(), now=performance.now();
+  if(db>THRESH_DB){
+    lastVoiceT=now; consecAbove++;
+    if(!speaking && consecAbove>=GATE_FRAMES){ speaking=true; onSpeechStart(); }
+  } else {
+    consecAbove=0;
+    if(speaking && now-lastVoiceT>END_SILENCE_MS){ speaking=false; onSpeechEnd(); }
+  }
+}
+function onSpeechStart(){ /* capture runs to end-silence; nothing to do */ }
+function onSpeechEnd(){
+  if(mode!=="listen") return;
+  clearTimeout(listenTimer);
+  mode="scoring"; ring.classList.remove("glow");
+  setStatus("…"); scoreEl.textContent="";
+  const finish=()=>{ const blob=new Blob(chunks,{type:(rec&&rec.mimeType)||"audio/mp4"});
+                     scoreUtterance(blob); };
+  if(rec && rec.state!=="inactive"){ rec.onstop=finish; try{rec.stop();}catch(e){ finish(); } }
+  else finish();
+}
+async function scoreUtterance(blob){
+  scoreCtrl=new AbortController();
+  const sT0=performance.now();
+  const to=setTimeout(()=>{ try{scoreCtrl.abort();}catch(e){} }, SCORE_TIMEOUT_MS);
+  let d={};
+  try{
+    const r=await fetch(RELAY+"/score?ref="+encodeURIComponent(REF),
+      {method:"POST", body:blob, signal:scoreCtrl.signal});
+    clearTimeout(to); d=await r.json();
+  }catch(e){ clearTimeout(to); d={error:"timeout"}; }
+  scoreCtrl=null;
+  if(mode!=="scoring") return;
+  const b=cur();
+  const rec0={block:blockIdx+1, trial:trialInBlock+1, say:b.say, kind:b.kind,
+    score:typeof d.accuracy==="number"?Math.round(d.accuracy):null,
+    text:d.text||"", err:d.error||"", ms:Math.round(performance.now()-sT0)};
+  trials.push(rec0);
+  showResult(rec0);
+}
+function showResult(r){
+  mode="result";
+  scoreEl.textContent = r.score===null ? "—" : r.score;
+  scoreEl.style.color = r.score===null ? "#a8a29e" : (r.score>=85 ? "#15803d" : (r.score>=75 ? "#b45309" : "#b91c1c"));
+  setStatus(r.score===null ? ("Not heard ("+(r.err||"?")+")") : ("Heard: "+(r.text||"?")));
+  setDbg("trial "+trialNo()+"/20 · block "+(blockIdx+1)+"/2 · say "+cur().say);
+  $("next").style.display=""; $("redo").style.display="";
+}
+function nextTrial(){
+  $("next").style.display="none"; $("redo").style.display="none";
+  scoreEl.textContent="";
+  trialInBlock++;
+  const b=cur();
+  if(trialInBlock>=b.n){
+    blockIdx++; trialInBlock=0;
+    if(blockIdx>=BLOCKS.length){ finish(); return; }
+  }
+  goListen();
+}
+function redoTrial(){
+  const t=trials.pop(); if(t) t.redone=true;
+  $("next").style.display="none"; $("redo").style.display="none";
+  scoreEl.textContent="";
+  goListen();
+}
+function goListen(){
+  const b=cur();
+  mode="listen"; ring.classList.add("glow");
+  setStatus("Say "+b.say+"!");
+  $("word") && ($("word").textContent=b.say);
+  chunks=[];
+  try{
+    rec=new MediaRecorder(micStream);
+    rec.ondataavailable=e=>{ if(e.data.size) chunks.push(e.data); };
+    rec.start(250);
+  }catch(e){ setDbg("recorder: "+e); }
+  clearTimeout(listenTimer);
+  listenTimer=setTimeout(()=>{ if(mode!=="listen") return; onSpeechEnd(); }, LISTEN_TIMEOUT_MS);
+}
+function finish(){
+  mode="done"; ring.classList.remove("glow");
+  setStatus("Done! Tap Copy results and send them to me.");
+  scoreEl.textContent="✓";
+  $("copybtn").style.display="";
+  setDbg(trials.length+" trials recorded");
+}
+function copyResults(){
+  const out={tool:"aqt-calibration", ref:REF, speaker:speaker, ua:ua,
+    t:new Date().toISOString(), trials:trials};
+  const txt=JSON.stringify(out);
+  navigator.clipboard.writeText(txt).then(
+    ()=>setDbg("copied ✓ ("+trials.length+" trials)"),
+    ()=>setDbg("copy failed — long-press to select"));
+}
+async function start(){
+  speaker=($("speaker").value||"child-1").trim()||"child-1";
+  $("setup").style.display="none"; ring.style.display="";
+  setStatus("Getting the mic ready…");
+  try{
+    micStream=await navigator.mediaDevices.getUserMedia({audio:{
+      echoCancellation:true, noiseSuppression:true, autoGainControl:true}});
+    AC=new (window.AudioContext||window.webkitAudioContext)();
+    if(AC.state==="suspended") await AC.resume();
+    const src=AC.createMediaStreamSource(micStream);
+    analyser=AC.createAnalyser(); analyser.fftSize=2048;
+    tbuf=new Float32Array(analyser.fftSize);
+    src.connect(analyser);
+    lastVoiceT=performance.now();
+    setInterval(vadTick, GATE_TICK_MS);
+  }catch(e){ setStatus("Mic blocked — allow the microphone and reload."); return; }
+  goListen();
+}
+$("start").addEventListener("click", start);
+$("next").addEventListener("click", nextTrial);
+$("redo").addEventListener("click", redoTrial);
+$("copybtn").addEventListener("click", copyResults);
+</script>
+</body>
+</html>
