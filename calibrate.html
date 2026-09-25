@@ -161,7 +161,7 @@ function showResult(r){
   scoreEl.style.color = r.score===null ? "#a8a29e" : (r.score>=85 ? "#15803d" : (r.score>=75 ? "#b45309" : "#b91c1c"));
   setStatus(r.score===null ? ("Not heard ("+(r.err||"?")+")") : ("Heard: "+(r.text||"?")));
   setDbg("trial "+trialNo()+"/20 · block "+(blockIdx+1)+"/2 · say "+cur().say);
-  $("next").style.display=""; $("redo").style.display="";
+  $("next").style.display="inline-block"; $("redo").style.display="inline-block";
 }
 function nextTrial(){
   logEv("next_tap");
@@ -205,7 +205,7 @@ async function goListen(){
   logEv("listen_start",{block:blockIdx+1,trial:trialInBlock+1,say:b.say});
   mode="listen"; ring.classList.add("glow");
   floorBuf=[]; noiseFloor=null;
-  $("skip").style.display="";
+  $("skip").style.display="inline-block";
   setStatus("Say "+b.say+"!");
   $("word").textContent=b.say;
   chunks=[];
