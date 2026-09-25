@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Miss Aapa — ط Lesson (proof)</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { height:100%; overflow:hidden; }
+  body { font-family:-apple-system,system-ui,sans-serif; background:#fdf6ec;
+         display:flex; flex-direction:column; align-items:center; justify-content:center;
+         color:#4a3728; }
+  #letter { font-size:22vw; line-height:1; color:#0f766e; margin-bottom:2vh; }
+  #aapa { width:34vw; height:34vw; max-width:220px; max-height:220px; border-radius:50%;
+          background:radial-gradient(circle at 35% 30%, #5eead4, #0d9488 70%);
+          display:flex; align-items:center; justify-content:center;
+          font-size:16vw; transition:box-shadow .2s, transform .3s; }
+  #aapa.glow { box-shadow:0 0 0 6px #fbbf24, 0 0 44px 10px #fbbf24; animation:pulse 1.2s infinite; }
+  #aapa.think { transform:rotate(-8deg); box-shadow:0 0 0 4px #c4b5fd, 0 0 24px 4px #c4b5fd; }
+  @keyframes pulse { 50% { box-shadow:0 0 0 10px #fbbf24, 0 0 60px 16px #fbbf24; } }
+  #status { margin-top:3vh; font-size:5vw; text-align:center; min-height:8vw; padding:0 6vw; }
+  #start { margin-top:3vh; font-size:6vw; padding:3vw 10vw; border-radius:999px; border:none;
+           background:#0d9488; color:#fff; }
+  #dbg { position:fixed; bottom:2vh; font-size:3.4vw; color:#a8a29e; text-align:center; width:100%; }
+</style>
+</head>
+<body>
+<div id="letter">ط</div>
+<div id="aapa">🧕</div>
+<div id="status">Tap start, then say hello!</div>
+<button id="start">Start</button>
+<div id="dbg"></div>
+<script>
+"use strict";
+// ---- config ----
+const RELAY = "RELAY_URL_HERE";          // filled at deploy time
+const REF = "طيارة";
+const PASS = 85;                          // >=85 correct (provisional)
+const THRESH_DB = -28;                    // speech-start threshold (Stage 1)
+const END_SILENCE_MS = 800;               // utterance end = 800ms below threshold
+const LISTEN_TIMEOUT_MS = 25000;          // reprompt if child silent this long
+const SCORE_TIMEOUT_MS = 25000;
+const LINES = {
+  greet:"audio/greet.mp3", ack:"audio/ack.mp3", prompt:"audio/prompt_word.mp3",
+  praise:"audio/praise.mp3", retry:"audio/retry.mp3", not_heard:"audio/not_heard.mp3",
+  complete:"audio/complete.mp3", barge:"audio/barge.mp3",
+};
+// ---- state ----
+let AC=null, analyser=null, micStream=null;
+let speaking=false, lastVoiceT=0;
+let mode="idle";            // idle|miss_speaking|listen|scoring|done
+let successes=0, listenTimer=0, rec=null, chunks=[];
+let turn=0;                 // generation guard against stale score callbacks
+let scoreCtrl=null;
+const $=id=>document.getElementById(id);
+const aapa=$("aapa"), statusEl=$("status"), dbg=$("dbg");
+const player=new Audio(); player.preload="auto";
+
+function setStatus(t){ statusEl.textContent=t; }
+function setDbg(t){ dbg.textContent=t; }
+function glow(on){ aapa.classList.toggle("glow",on); }
+function think(on){ aapa.classList.toggle("think",on); }
+
+function playLine(name, then){
+  try{player.pause();}catch(e){}
+  mode="miss_speaking";
+  think(false); glow(false);
+  player.src=LINES[name];
+  player.onended=()=>{ if(then) then(); };
+  player.onerror=()=>{ if(then) then(); };
+  player.play().catch(()=>{ if(then) then(); });
+}
+
+function dbfs(){
+  const b=new Float32Array(analyser.fftSize);
+  analyser.getFloatTimeDomainData(b);
+  let s=0; for(let i=0;i<b.length;i++) s+=b[i]*b[i];
+  const r=Math.sqrt(s/b.length);
+  return r>0 ? 20*Math.log10(r) : -100;
+}
+function vadLoop(){
+  const db=dbfs(), now=performance.now();
+  if(db>THRESH_DB){ lastVoiceT=now;
+    if(!speaking){ speaking=true; onSpeechStart(); }
+  } else if(speaking && now-lastVoiceT>END_SILENCE_MS){
+    speaking=false; onSpeechEnd();
+  }
+  requestAnimationFrame(vadLoop);
+}
+function onSpeechStart(){
+  // Teams-like barge-in: child voice stops Miss Aapa instantly, even mid-ack.
+  if(mode==="miss_speaking"){
+    turn++;
+    if(scoreCtrl){ try{scoreCtrl.abort();}catch(e){} scoreCtrl=null; }
+    playLine("barge", goListen);
+  }
+}
+function onSpeechEnd(){
+  if(mode!=="listen") return;
+  clearTimeout(listenTimer);
+  const myTurn=turn;
+  const finish=()=>{ const blob=new Blob(chunks,{type:(rec&&rec.mimeType)||"audio/mp4"});
+                     scoreUtterance(blob,myTurn); };
+  if(rec && rec.state!=="inactive"){ rec.onstop=finish; try{rec.stop();}catch(e){ finish(); } }
+  else finish();
+  // immediate acknowledgment; the real verdict follows the real score
+  playLine("ack", ()=>{ if(turn===myTurn) mode="scoring"; });
+}
+async function scoreUtterance(blob, myTurn){
+  think(true); setStatus("Hmm…");
+  scoreCtrl=new AbortController();
+  const to=setTimeout(()=>{ try{scoreCtrl.abort();}catch(e){} }, SCORE_TIMEOUT_MS);
+  try{
+    const r=await fetch(RELAY+"/score?ref="+encodeURIComponent(REF),
+      {method:"POST", body:blob, signal:scoreCtrl.signal});
+    clearTimeout(to); scoreCtrl=null;
+    if(myTurn!==turn) return;                    // stale: child barged in
+    const d=await r.json();
+    think(false);
+    if(d.error){ setDbg("score: "+d.error); playLine("not_heard", goListen); return; }
+    setDbg("heard: "+(d.text||"?")+" — score "+Math.round(d.accuracy));
+    if(d.accuracy>=PASS){ successes++; playLine("praise", ()=>{
+        if(successes>=2){ playLine("complete", ()=>{ mode="done"; glow(false);
+          setStatus("Mashallah! Done!"); }); }
+        else playLine("prompt", goListen);
+      }); }
+    else playLine("retry", ()=>playLine("prompt", goListen));
+  }catch(e){ clearTimeout(to); scoreCtrl=null;
+    if(myTurn!==turn) return;
+    think(false); setDbg("score: timeout"); playLine("not_heard", goListen); }
+}
+function goListen(){
+  mode="listen"; glow(true); think(false);
+  setStatus("Your turn! Say طيارة");
+  chunks=[];
+  try{
+    rec=new MediaRecorder(micStream);
+    rec.ondataavailable=e=>{ if(e.data.size) chunks.push(e.data); };
+    rec.start(250);
+  }catch(e){ setDbg("recorder: "+e); }
+  clearTimeout(listenTimer);
+  listenTimer=setTimeout(()=>{ if(mode==="listen") playLine("not_heard", goListen); },
+    LISTEN_TIMEOUT_MS);
+}
+async function start(){
+  $("start").style.display="none";
+  setStatus("Getting the mic ready…");
+  try{
+    micStream=await navigator.mediaDevices.getUserMedia({audio:{
+      echoCancellation:true, noiseSuppression:true, autoGainControl:true}});
+    AC=new (window.AudioContext||window.webkitAudioContext)();
+    if(AC.state==="suspended") await AC.resume();
+    const src=AC.createMediaStreamSource(micStream);
+    analyser=AC.createAnalyser(); analyser.fftSize=2048;
+    src.connect(analyser);
+    lastVoiceT=performance.now();
+    requestAnimationFrame(vadLoop);
+  }catch(e){ setStatus("Mic blocked — allow the microphone and reload."); return; }
+  playLine("greet", ()=>playLine("prompt", goListen));
+}
+$("start").addEventListener("click", start);
+</script>
+</body>
+</html>
