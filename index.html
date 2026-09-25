@@ -27,28 +27,35 @@
 <body>
 <div id="letter">ط</div>
 <div id="aapa">🧕</div>
-<div id="status">Tap start, then say hello!</div>
+<div id="status">Tap Start to begin the ط lesson!</div>
 <button id="start">Start</button>
 <div id="dbg"></div>
 <script>
 "use strict";
 // ---- config ----
-const RELAY = new URLSearchParams(location.search).get("relay") || "RELAY_URL_HERE";
+const RELAY = new URLSearchParams(location.search).get("relay")
+  || "https://aqt-relay-erdph4b2asewbegg.canadacentral-01.azurewebsites.net";
 const REF = "طيارة";
-const PASS = 85;                          // >=85 correct (provisional)
-const THRESH_DB = -28;                    // speech-start threshold (Stage 1)
-const END_SILENCE_MS = 800;               // utterance end = 800ms below threshold
-const LISTEN_TIMEOUT_MS = 25000;          // reprompt if child silent this long
-const SCORE_TIMEOUT_MS = 25000;
+const PASS = 85;                 // >=85 correct (provisional, needs calibration)
+const GRAY = 75;                 // 75-84 gray: practice again
+const THRESH_DB = -28;           // speech-start threshold (Stage 1 iPhone)
+const GATE_FRAMES = 3;           // sustained-speech gate: 3 x 10ms frames
+const GATE_TICK_MS = 10;
+const END_SILENCE_MS = 800;      // utterance end = 800ms below threshold
+const LISTEN_TIMEOUT_MS = 25000; // hard timeout on every listen
+const SCORE_TIMEOUT_MS = 25000;  // hard timeout on every score
 const LINES = {
-  greet:"audio/greet.mp3", ack:"audio/ack.mp3", prompt:"audio/prompt_word.mp3",
-  praise:"audio/praise.mp3", retry:"audio/retry.mp3", not_heard:"audio/not_heard.mp3",
-  complete:"audio/complete.mp3", barge:"audio/barge.mp3",
+  greet:"audio/greet.mp3", model:"audio/model_tah.mp3", ack:"audio/ack.mp3",
+  prompt:"audio/prompt_word.mp3", praise:"audio/praise.mp3",
+  retry:"audio/retry.mp3", almost:"audio/almost.mp3",
+  not_heard:"audio/not_heard.mp3", complete:"audio/complete.mp3",
+  barge:"audio/barge.mp3",
 };
 // ---- state ----
-let AC=null, analyser=null, micStream=null;
-let speaking=false, lastVoiceT=0;
+let AC=null, analyser=null, micStream=null, tbuf=null;
+let speaking=false, lastVoiceT=0, consecAbove=0;
 let mode="idle";            // idle|miss_speaking|listen|scoring|done
+let phase="isolated";       // isolated|word — which listen we are in
 let successes=0, listenTimer=0, rec=null, chunks=[];
 let turn=0;                 // generation guard against stale score callbacks
 let scoreCtrl=null;
@@ -72,66 +79,95 @@ function playLine(name, then){
 }
 
 function dbfs(){
-  const b=new Float32Array(analyser.fftSize);
-  analyser.getFloatTimeDomainData(b);
-  let s=0; for(let i=0;i<b.length;i++) s+=b[i]*b[i];
-  const r=Math.sqrt(s/b.length);
+  analyser.getFloatTimeDomainData(tbuf);
+  let s=0; for(let i=0;i<tbuf.length;i++) s+=tbuf[i]*tbuf[i];
+  const r=Math.sqrt(s/tbuf.length);
   return r>0 ? 20*Math.log10(r) : -100;
 }
-function vadLoop(){
+function vadTick(){
   const db=dbfs(), now=performance.now();
-  if(db>THRESH_DB){ lastVoiceT=now;
-    if(!speaking){ speaking=true; onSpeechStart(); }
-  } else if(speaking && now-lastVoiceT>END_SILENCE_MS){
-    speaking=false; onSpeechEnd();
+  if(db>THRESH_DB){
+    lastVoiceT=now; consecAbove++;
+    // sustained-speech gate (Stage 1): 3 consecutive frames before declaring
+    if(!speaking && consecAbove>=GATE_FRAMES){ speaking=true; onSpeechStart(); }
+  } else {
+    consecAbove=0;
+    if(speaking && now-lastVoiceT>END_SILENCE_MS){ speaking=false; onSpeechEnd(); }
   }
-  requestAnimationFrame(vadLoop);
 }
 function onSpeechStart(){
-  // Teams-like barge-in: child voice stops Miss Aapa instantly, even mid-ack.
-  if(mode==="miss_speaking"){
+  // Teams-like barge-in: child voice stops Miss Aapa instantly, even mid-ack
+  // or while a score is still pending. Never respond to the stale turn.
+  if(mode==="miss_speaking" || mode==="scoring"){
     turn++;
     if(scoreCtrl){ try{scoreCtrl.abort();}catch(e){} scoreCtrl=null; }
-    playLine("barge", goListen);
+    clearTimeout(listenTimer);
+    playLine("barge", ()=>goListen(phase));
   }
 }
 function onSpeechEnd(){
   if(mode!=="listen") return;
   clearTimeout(listenTimer);
-  const myTurn=turn;
+  const myTurn=turn, myPhase=phase;
   const finish=()=>{ const blob=new Blob(chunks,{type:(rec&&rec.mimeType)||"audio/mp4"});
-                     scoreUtterance(blob,myTurn); };
+                     if(myPhase==="isolated") onIsolatedAttempt(myTurn);
+                     else scoreUtterance(blob,myTurn); };
   if(rec && rec.state!=="inactive"){ rec.onstop=finish; try{rec.stop();}catch(e){ finish(); } }
   else finish();
-  // immediate acknowledgment; the real verdict follows the real score
-  playLine("ack", ()=>{ if(turn===myTurn) mode="scoring"; });
+}
+function onIsolatedAttempt(myTurn){
+  // The isolated ط is accepted on genuine sustained speech — never scored
+  // (bare-letter scoring is unreliable). Acknowledge immediately, honestly:
+  // this claims she heard the try, not that it was correct.
+  playLine("ack", ()=>{ if(turn!==myTurn) return;
+    playLine("prompt", ()=>{ if(turn===myTurn) goListen("word"); }); });
 }
 async function scoreUtterance(blob, myTurn){
-  think(true); setStatus("Hmm…");
+  mode="scoring"; think(true); glow(false); setStatus("Hmm…");
+  // immediate acknowledgment of the genuine attempt; verdict follows the score
   scoreCtrl=new AbortController();
   const to=setTimeout(()=>{ try{scoreCtrl.abort();}catch(e){} }, SCORE_TIMEOUT_MS);
   try{
     const r=await fetch(RELAY+"/score?ref="+encodeURIComponent(REF),
       {method:"POST", body:blob, signal:scoreCtrl.signal});
     clearTimeout(to); scoreCtrl=null;
-    if(myTurn!==turn) return;                    // stale: child barged in
+    if(myTurn!==turn || mode!=="scoring") return;  // stale: child barged in
     const d=await r.json();
     think(false);
-    if(d.error){ setDbg("score: "+d.error); playLine("not_heard", goListen); return; }
+    if(d.error || typeof d.accuracy!=="number"){
+      setDbg("score: "+(d.error||"bad_response"));
+      playLine("not_heard", ()=>{ if(turn===myTurn)
+        playLine("prompt", ()=>{ if(turn===myTurn) goListen("word"); }); });
+      return;
+    }
     setDbg("heard: "+(d.text||"?")+" — score "+Math.round(d.accuracy));
-    if(d.accuracy>=PASS){ successes++; playLine("praise", ()=>{
-        if(successes>=2){ playLine("complete", ()=>{ mode="done"; glow(false);
-          setStatus("Mashallah! Done!"); }); }
-        else playLine("prompt", goListen);
-      }); }
-    else playLine("retry", ()=>playLine("prompt", goListen));
+    if(d.accuracy>=PASS){
+      successes++;
+      playLine("praise", ()=>{ if(turn!==myTurn) return;
+        if(successes>=2){ playLine("complete", ()=>{ if(turn===myTurn){
+          mode="done"; glow(false); setStatus("Mashallah! Done!"); } }); }
+        else playLine("prompt", ()=>{ if(turn===myTurn) goListen("word"); });
+      });
+    } else if(d.accuracy>=GRAY){
+      playLine("almost", ()=>{ if(turn===myTurn)
+        playLine("prompt", ()=>{ if(turn===myTurn) goListen("word"); }); });
+    } else {
+      playLine("retry", ()=>{ if(turn===myTurn)
+        playLine("prompt", ()=>{ if(turn===myTurn) goListen("word"); }); });
+    }
   }catch(e){ clearTimeout(to); scoreCtrl=null;
-    if(myTurn!==turn) return;
-    think(false); setDbg("score: timeout"); playLine("not_heard", goListen); }
+    if(myTurn!==turn || mode!=="scoring") return;
+    think(false); setDbg("score: timeout");
+    playLine("not_heard", ()=>{ if(turn===myTurn)
+      playLine("prompt", ()=>{ if(turn===myTurn) goListen("word"); }); });
+  }
 }
-function goListen(){
-  mode="listen"; glow(true); think(false);
-  setStatus("Your turn! Say طيارة");
+function goListen(which){
+  // A new listen always invalidates any in-flight score first.
+  turn++;
+  if(scoreCtrl){ try{scoreCtrl.abort();}catch(e){} scoreCtrl=null; }
+  phase=which; mode="listen"; glow(true); think(false);
+  setStatus(which==="isolated" ? "Your turn — say ط!" : "Your turn! Say طيارة");
   chunks=[];
   try{
     rec=new MediaRecorder(micStream);
@@ -139,8 +175,11 @@ function goListen(){
     rec.start(250);
   }catch(e){ setDbg("recorder: "+e); }
   clearTimeout(listenTimer);
-  listenTimer=setTimeout(()=>{ if(mode==="listen") playLine("not_heard", goListen); },
-    LISTEN_TIMEOUT_MS);
+  listenTimer=setTimeout(()=>{
+    if(mode!=="listen") return;
+    if(which==="isolated") playLine("model", ()=>goListen("isolated"));
+    else playLine("not_heard", ()=>playLine("prompt", ()=>goListen("word")));
+  }, LISTEN_TIMEOUT_MS);
 }
 async function start(){
   $("start").style.display="none";
@@ -152,11 +191,12 @@ async function start(){
     if(AC.state==="suspended") await AC.resume();
     const src=AC.createMediaStreamSource(micStream);
     analyser=AC.createAnalyser(); analyser.fftSize=2048;
+    tbuf=new Float32Array(analyser.fftSize);
     src.connect(analyser);
     lastVoiceT=performance.now();
-    requestAnimationFrame(vadLoop);
+    setInterval(vadTick, GATE_TICK_MS);
   }catch(e){ setStatus("Mic blocked — allow the microphone and reload."); return; }
-  playLine("greet", ()=>playLine("prompt", goListen));
+  playLine("greet", ()=>playLine("model", ()=>goListen("isolated")));
 }
 $("start").addEventListener("click", start);
 </script>
