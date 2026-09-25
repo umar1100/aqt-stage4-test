@@ -22,8 +22,12 @@
   #start { background:#0d9488; color:#fff; }
   #next { background:#0d9488; color:#fff; display:none; }
   #redo { background:#fff; color:#8a7a66; border:2px solid #d6c7b4; display:none; }
-  #copybtn { background:#fff; color:#8a7a66; border:2px solid #d6c7b4; display:none;
-             position:fixed; top:2vh; right:3vw; font-size:3.6vw; padding:1.5vw 3vw; }
+  #copybtn { background:#fff; color:#8a7a66; border:2px solid #d6c7b4;
+             position:fixed; top:2vh; right:3vw; font-size:3.6vw; padding:1.5vw 3vw;
+             border-radius:999px; opacity:.9; }
+  #skip { position:fixed; bottom:2vh; right:3vw; font-size:3.6vw; padding:1.5vw 3vw;
+          border-radius:999px; border:1px solid #d6c7b4; background:#fff; color:#8a7a66;
+          opacity:.85; display:none; }
   #setup { display:flex; flex-direction:column; align-items:center; gap:2vh; }
   #setup input { font-size:5vw; padding:2vw 4vw; border-radius:12px; border:2px solid #d6c7b4;
                  width:70vw; text-align:center; }
@@ -47,7 +51,8 @@
 <div id="score"></div>
 <button class="btn" id="next">Next →</button>
 <button class="btn" id="redo">↺ Redo</button>
-<button id="copybtn">📋 Copy results</button>
+<button id="copybtn">📋 Copy log</button>
+<button id="skip">skip →</button>
 <div id="dbg"></div>
 <script>
 "use strict";
@@ -72,6 +77,19 @@ const $=id=>document.getElementById(id);
 const ring=$("ring"), statusEl=$("status"), scoreEl=$("score"), dbg=$("dbg");
 const t0=performance.now();
 const ua=(navigator.userAgent||"").slice(0,80);
+// ---- diagnostic event log (always copyable, even mid-run) ----
+const LOG=[];
+function logEv(name, data){ LOG.push(Object.assign({t:+((performance.now()-t0)/1000).toFixed(2), ev:name}, data||{})); }
+window.addEventListener("error", e=>{ try{logEv("window_error",{msg:String(e.message||e.error).slice(0,140)});}catch(_){} });
+function logText(){
+  const lines=["AQT CALIBRATION LOG", new Date().toISOString(), "speaker="+speaker, ""];
+  for(const e of LOG){
+    const rest=Object.keys(e).filter(k=>k!=="t"&&k!=="ev").map(k=>k+"="+e[k]).join(" ");
+    lines.push("+"+e.t+"s "+e.ev+(rest?" "+rest:""));
+  }
+  lines.push("", "TRIALS "+JSON.stringify(trials));
+  return lines.join("\n");
+}
 
 function setStatus(t){ statusEl.textContent=t; }
 function setDbg(t){ dbg.textContent=t; }
@@ -89,7 +107,7 @@ function vadTick(){
   const db=dbfs(), now=performance.now();
   if(db>THRESH_DB){
     lastVoiceT=now; consecAbove++;
-    if(!speaking && consecAbove>=GATE_FRAMES){ speaking=true; onSpeechStart(); }
+    if(!speaking && consecAbove>=GATE_FRAMES){ speaking=true; logEv("speech_start"); onSpeechStart(); }
   } else {
     consecAbove=0;
     if(speaking && now-lastVoiceT>END_SILENCE_MS){ speaking=false; onSpeechEnd(); }
@@ -99,34 +117,38 @@ function onSpeechStart(){ /* capture runs to end-silence; nothing to do */ }
 function onSpeechEnd(){
   if(mode!=="listen") return;
   clearTimeout(listenTimer);
+  logEv("speech_end");
   mode="scoring"; ring.classList.remove("glow");
   setStatus("…"); scoreEl.textContent="";
   const finish=()=>{ const blob=new Blob(chunks,{type:(rec&&rec.mimeType)||"audio/mp4"});
                      scoreUtterance(blob); };
-  if(rec && rec.state!=="inactive"){ rec.onstop=finish; try{rec.stop();}catch(e){ finish(); } }
+  if(rec && rec.state!=="inactive"){ rec.onstop=finish; try{rec.stop();}catch(e){ logEv("recorder_stop_err",{err:String(e).slice(0,60)}); finish(); } }
   else finish();
 }
 async function scoreUtterance(blob){
   scoreCtrl=new AbortController();
   const sT0=performance.now();
+  logEv("score_request",{block:blockIdx+1,trial:trialInBlock+1,bytes:blob.size});
   const to=setTimeout(()=>{ try{scoreCtrl.abort();}catch(e){} }, SCORE_TIMEOUT_MS);
   let d={};
   try{
     const r=await fetch(RELAY+"/score?ref="+encodeURIComponent(REF),
       {method:"POST", body:blob, signal:scoreCtrl.signal});
     clearTimeout(to); d=await r.json();
-  }catch(e){ clearTimeout(to); d={error:"timeout"}; }
+  }catch(e){ clearTimeout(to); d={error:"timeout"}; logEv("score_error",{err:String((e&&e.name)||e).slice(0,60)}); }
   scoreCtrl=null;
-  if(mode!=="scoring") return;
+  if(mode!=="scoring"){ logEv("score_late_drop",{mode:mode}); return; }
   const b=cur();
   const rec0={block:blockIdx+1, trial:trialInBlock+1, say:b.say, kind:b.kind,
     score:typeof d.accuracy==="number"?Math.round(d.accuracy):null,
     text:d.text||"", err:d.error||"", ms:Math.round(performance.now()-sT0)};
   trials.push(rec0);
+  logEv("score_result",{score:rec0.score,text:(rec0.text||"").slice(0,24),err:rec0.err,ms:rec0.ms});
   showResult(rec0);
 }
 function showResult(r){
   mode="result";
+  $("skip").style.display="none";
   scoreEl.textContent = r.score===null ? "—" : r.score;
   scoreEl.style.color = r.score===null ? "#a8a29e" : (r.score>=85 ? "#15803d" : (r.score>=75 ? "#b45309" : "#b91c1c"));
   setStatus(r.score===null ? ("Not heard ("+(r.err||"?")+")") : ("Heard: "+(r.text||"?")));
@@ -134,7 +156,8 @@ function showResult(r){
   $("next").style.display=""; $("redo").style.display="";
 }
 function nextTrial(){
-  $("next").style.display="none"; $("redo").style.display="none";
+  logEv("next_tap");
+  $("next").style.display="none"; $("redo").style.display="none"; $("skip").style.display="none";
   scoreEl.textContent="";
   trialInBlock++;
   const b=cur();
@@ -145,42 +168,63 @@ function nextTrial(){
   goListen();
 }
 function redoTrial(){
+  logEv("redo_tap");
   const t=trials.pop(); if(t) t.redone=true;
-  $("next").style.display="none"; $("redo").style.display="none";
+  $("next").style.display="none"; $("redo").style.display="none"; $("skip").style.display="none";
   scoreEl.textContent="";
   goListen();
 }
-function goListen(){
+function skipTrial(){
+  logEv("skip_tap",{mode:mode,block:blockIdx+1,trial:trialInBlock+1});
+  clearTimeout(listenTimer);
+  if(scoreCtrl){ try{scoreCtrl.abort();}catch(e){} scoreCtrl=null; }
+  trials.push({block:blockIdx+1,trial:trialInBlock+1,say:cur().say,kind:cur().kind,skipped:true});
+  $("skip").style.display="none";
+  nextTrial();
+}
+async function goListen(){
   const b=cur();
+  // Re-acquire the mic if iOS killed the track mid-run.
+  try{
+    const tr=micStream&&micStream.getAudioTracks()[0];
+    if(!tr||tr.readyState!=="live"){
+      logEv("mic_reacquire");
+      micStream=await navigator.mediaDevices.getUserMedia({audio:{
+        echoCancellation:true, noiseSuppression:true, autoGainControl:true}});
+      AC.createMediaStreamSource(micStream).connect(analyser);
+    }
+  }catch(e){ logEv("mic_reacquire_err",{err:String(e).slice(0,60)}); }
+  logEv("listen_start",{block:blockIdx+1,trial:trialInBlock+1,say:b.say});
   mode="listen"; ring.classList.add("glow");
+  $("skip").style.display="";
   setStatus("Say "+b.say+"!");
-  $("word") && ($("word").textContent=b.say);
+  $("word").textContent=b.say;
   chunks=[];
   try{
     rec=new MediaRecorder(micStream);
     rec.ondataavailable=e=>{ if(e.data.size) chunks.push(e.data); };
     rec.start(250);
-  }catch(e){ setDbg("recorder: "+e); }
+  }catch(e){ logEv("recorder_error",{err:String(e).slice(0,80)}); setStatus("Recorder failed — tap skip →"); return; }
   clearTimeout(listenTimer);
-  listenTimer=setTimeout(()=>{ if(mode!=="listen") return; onSpeechEnd(); }, LISTEN_TIMEOUT_MS);
+  listenTimer=setTimeout(()=>{ if(mode!=="listen") return; logEv("listen_timeout"); onSpeechEnd(); }, LISTEN_TIMEOUT_MS);
 }
 function finish(){
   mode="done"; ring.classList.remove("glow");
-  setStatus("Done! Tap Copy results and send them to me.");
+  $("skip").style.display="none";
+  setStatus("Done! Tap 📋 Copy log and send it to me.");
   scoreEl.textContent="✓";
-  $("copybtn").style.display="";
+  logEv("test_done",{trials:trials.length});
   setDbg(trials.length+" trials recorded");
 }
 function copyResults(){
-  const out={tool:"aqt-calibration", ref:REF, speaker:speaker, ua:ua,
-    t:new Date().toISOString(), trials:trials};
-  const txt=JSON.stringify(out);
+  const txt=logText();
   navigator.clipboard.writeText(txt).then(
-    ()=>setDbg("copied ✓ ("+trials.length+" trials)"),
+    ()=>setDbg("log copied ✓ ("+LOG.length+" events)"),
     ()=>setDbg("copy failed — long-press to select"));
 }
 async function start(){
   speaker=($("speaker").value||"child-1").trim()||"child-1";
+  logEv("test_start",{speaker:speaker});
   $("setup").style.display="none"; ring.style.display="";
   setStatus("Getting the mic ready…");
   try{
@@ -200,6 +244,7 @@ async function start(){
 $("start").addEventListener("click", start);
 $("next").addEventListener("click", nextTrial);
 $("redo").addEventListener("click", redoTrial);
+$("skip").addEventListener("click", skipTrial);
 $("copybtn").addEventListener("click", copyResults);
 </script>
 </body>
