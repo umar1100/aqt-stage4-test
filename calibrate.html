@@ -73,6 +73,7 @@ let mode="idle";            // idle|listen|scoring|result|done
 let blockIdx=0, trialInBlock=0, listenTimer=0, rec=null, chunks=[];
 let trials=[];              // {block, trial, say, kind, score, text, ms, error}
 let speaker="?", scoreCtrl=null;
+let floorBuf=[], noiseFloor=null;   // ambient dBFS captured just before each utterance
 const $=id=>document.getElementById(id);
 const ring=$("ring"), statusEl=$("status"), scoreEl=$("score"), dbg=$("dbg");
 const t0=performance.now();
@@ -105,9 +106,15 @@ function dbfs(){
 function vadTick(){
   if(mode!=="listen") return;
   const db=dbfs(), now=performance.now();
+  if(!speaking){ floorBuf.push(db); if(floorBuf.length>100) floorBuf.shift(); }
   if(db>THRESH_DB){
     lastVoiceT=now; consecAbove++;
-    if(!speaking && consecAbove>=GATE_FRAMES){ speaking=true; logEv("speech_start"); onSpeechStart(); }
+    if(!speaking && consecAbove>=GATE_FRAMES){
+      speaking=true;
+      noiseFloor=floorBuf.length?Math.round(10*floorBuf.reduce((a,b)=>a+b,0)/floorBuf.length)/10:null;
+      floorBuf=[];
+      logEv("speech_start",{noiseDb:noiseFloor}); onSpeechStart();
+    }
   } else {
     consecAbove=0;
     if(speaking && now-lastVoiceT>END_SILENCE_MS){ speaking=false; onSpeechEnd(); }
@@ -141,9 +148,10 @@ async function scoreUtterance(blob){
   const b=cur();
   const rec0={block:blockIdx+1, trial:trialInBlock+1, say:b.say, kind:b.kind,
     score:typeof d.accuracy==="number"?Math.round(d.accuracy):null,
-    text:d.text||"", err:d.error||"", ms:Math.round(performance.now()-sT0)};
+    text:d.text||"", err:d.error||"", ms:Math.round(performance.now()-sT0),
+    noiseDb:noiseFloor};
   trials.push(rec0);
-  logEv("score_result",{score:rec0.score,text:(rec0.text||"").slice(0,24),err:rec0.err,ms:rec0.ms});
+  logEv("score_result",{score:rec0.score,text:(rec0.text||"").slice(0,24),err:rec0.err,ms:rec0.ms,noiseDb:rec0.noiseDb});
   showResult(rec0);
 }
 function showResult(r){
@@ -196,6 +204,7 @@ async function goListen(){
   }catch(e){ logEv("mic_reacquire_err",{err:String(e).slice(0,60)}); }
   logEv("listen_start",{block:blockIdx+1,trial:trialInBlock+1,say:b.say});
   mode="listen"; ring.classList.add("glow");
+  floorBuf=[]; noiseFloor=null;
   $("skip").style.display="";
   setStatus("Say "+b.say+"!");
   $("word").textContent=b.say;
