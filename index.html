@@ -33,7 +33,7 @@
 <script>
 "use strict";
 // ---- config ----
-const RELAY = "RELAY_URL_HERE";          // filled at deploy time
+const RELAY = new URLSearchParams(location.search).get("relay") || "RELAY_URL_HERE";
 const REF = "طيارة";
 const PASS = 85;                          // >=85 correct (provisional)
 const THRESH_DB = -28;                    // speech-start threshold (Stage 1)
