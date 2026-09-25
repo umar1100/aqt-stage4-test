@@ -30,6 +30,7 @@
 <div id="status">Tap Start to begin the ط lesson!</div>
 <button id="start">Start</button>
 <div id="dbg"></div>
+<button id="copylog" style="position:fixed;top:2vh;right:3vw;font-size:3.6vw;padding:1.5vw 3vw;border-radius:999px;border:1px solid #d6c7b4;background:#fff;color:#8a7a66;opacity:.85;">📋 Copy log</button>
 <script>
 "use strict";
 // ---- config ----
@@ -59,9 +60,30 @@ let phase="isolated";       // isolated|word — which listen we are in
 let successes=0, listenTimer=0, rec=null, chunks=[];
 let turn=0;                 // generation guard against stale score callbacks
 let scoreCtrl=null;
+let speechStartT=0;
 const $=id=>document.getElementById(id);
 const aapa=$("aapa"), statusEl=$("status"), dbg=$("dbg");
 const player=new Audio(); player.preload="auto";
+// ---- diagnostic log (proof only): one tap copies the whole test trace ----
+const t0=performance.now();
+const LOG=[];
+function logEv(name, data){
+  LOG.push(Object.assign({t:+((performance.now()-t0)/1000).toFixed(2), ev:name}, data||{}));
+}
+function logText(){
+  const lines=["MISS AAPA TAH LESSON LOG", new Date().toISOString(), ""];
+  for(const e of LOG){
+    const rest=Object.keys(e).filter(k=>k!=="t"&&k!=="ev")
+      .map(k=>k+"="+e[k]).join(" ");
+    lines.push("+"+e.t+"s "+e.ev+(rest?" "+rest:""));
+  }
+  const scores=LOG.filter(e=>e.ev==="score_result"&&typeof e.accuracy==="number").map(e=>Math.round(e.accuracy));
+  lines.push("", "summary: scores=["+scores.join(",")+"]"+
+    " barges="+LOG.filter(e=>e.ev==="barge").length+
+    " timeouts="+LOG.filter(e=>e.ev==="listen_timeout"||e.ev==="score_timeout").length+
+    " not_heard="+LOG.filter(e=>e.ev==="play"&&e.line==="not_heard").length);
+  return lines.join("\n");
+}
 
 function setStatus(t){ statusEl.textContent=t; }
 function setDbg(t){ dbg.textContent=t; }
@@ -72,10 +94,11 @@ function playLine(name, then){
   try{player.pause();}catch(e){}
   mode="miss_speaking";
   think(false); glow(false);
+  logEv("play", {line:name});
   player.src=LINES[name];
-  player.onended=()=>{ if(then) then(); };
-  player.onerror=()=>{ if(then) then(); };
-  player.play().catch(()=>{ if(then) then(); });
+  player.onended=()=>{ logEv("play_end", {line:name}); if(then) then(); };
+  player.onerror=()=>{ logEv("play_error", {line:name}); if(then) then(); };
+  player.play().catch(()=>{ logEv("play_error", {line:name}); if(then) then(); });
 }
 
 function dbfs(){
@@ -100,15 +123,22 @@ function onSpeechStart(){
   // or while a score is still pending. Never respond to the stale turn.
   if(mode==="miss_speaking" || mode==="scoring"){
     turn++;
+    logEv("barge", {during:mode});
     if(scoreCtrl){ try{scoreCtrl.abort();}catch(e){} scoreCtrl=null; }
     clearTimeout(listenTimer);
     playLine("barge", ()=>goListen(phase));
+  } else if(mode==="listen"){
+    logEv("speech_start", {phase:phase});
+    speechStartT=performance.now();
   }
 }
 function onSpeechEnd(){
   if(mode!=="listen") return;
   clearTimeout(listenTimer);
   const myTurn=turn, myPhase=phase;
+  const durMs=speechStartT?Math.round(performance.now()-speechStartT):-1;
+  speechStartT=0;
+  logEv("speech_end", {phase:myPhase, speechMs:durMs});
   const finish=()=>{ const blob=new Blob(chunks,{type:(rec&&rec.mimeType)||"audio/mp4"});
                      if(myPhase==="isolated") onIsolatedAttempt(myTurn);
                      else scoreUtterance(blob,myTurn); };
@@ -126,6 +156,8 @@ async function scoreUtterance(blob, myTurn){
   mode="scoring"; think(true); glow(false); setStatus("Hmm…");
   // immediate acknowledgment of the genuine attempt; verdict follows the score
   scoreCtrl=new AbortController();
+  const scoreT0=performance.now();
+  logEv("score_request");
   const to=setTimeout(()=>{ try{scoreCtrl.abort();}catch(e){} }, SCORE_TIMEOUT_MS);
   try{
     const r=await fetch(RELAY+"/score?ref="+encodeURIComponent(REF),
@@ -134,6 +166,8 @@ async function scoreUtterance(blob, myTurn){
     if(myTurn!==turn || mode!=="scoring") return;  // stale: child barged in
     const d=await r.json();
     think(false);
+    logEv("score_result", {accuracy:typeof d.accuracy==="number"?Math.round(d.accuracy):d.error||"bad",
+      text:d.text||"", ms:Math.round(performance.now()-scoreT0)});
     if(d.error || typeof d.accuracy!=="number"){
       setDbg("score: "+(d.error||"bad_response"));
       playLine("not_heard", ()=>{ if(turn===myTurn)
@@ -145,6 +179,7 @@ async function scoreUtterance(blob, myTurn){
       successes++;
       playLine("praise", ()=>{ if(turn!==myTurn) return;
         if(successes>=2){ playLine("complete", ()=>{ if(turn===myTurn){
+          logEv("lesson_complete", {successes:successes});
           mode="done"; glow(false); setStatus("Mashallah! Done!"); } }); }
         else playLine("prompt", ()=>{ if(turn===myTurn) goListen("word"); });
       });
@@ -157,6 +192,7 @@ async function scoreUtterance(blob, myTurn){
     }
   }catch(e){ clearTimeout(to); scoreCtrl=null;
     if(myTurn!==turn || mode!=="scoring") return;
+    logEv("score_timeout", {ms:SCORE_TIMEOUT_MS});
     think(false); setDbg("score: timeout");
     playLine("not_heard", ()=>{ if(turn===myTurn)
       playLine("prompt", ()=>{ if(turn===myTurn) goListen("word"); }); });
@@ -167,6 +203,7 @@ function goListen(which){
   turn++;
   if(scoreCtrl){ try{scoreCtrl.abort();}catch(e){} scoreCtrl=null; }
   phase=which; mode="listen"; glow(true); think(false);
+  logEv("listen_start", {phase:which});
   setStatus(which==="isolated" ? "Your turn — say ط!" : "Your turn! Say طيارة");
   chunks=[];
   try{
@@ -177,12 +214,14 @@ function goListen(which){
   clearTimeout(listenTimer);
   listenTimer=setTimeout(()=>{
     if(mode!=="listen") return;
+    logEv("listen_timeout", {phase:which});
     if(which==="isolated") playLine("model", ()=>goListen("isolated"));
     else playLine("not_heard", ()=>playLine("prompt", ()=>goListen("word")));
   }, LISTEN_TIMEOUT_MS);
 }
 async function start(){
   $("start").style.display="none";
+  logEv("test_start");
   setStatus("Getting the mic ready…");
   try{
     micStream=await navigator.mediaDevices.getUserMedia({audio:{
@@ -199,6 +238,11 @@ async function start(){
   playLine("greet", ()=>playLine("model", ()=>goListen("isolated")));
 }
 $("start").addEventListener("click", start);
+$("copylog").addEventListener("click", async ()=>{
+  const txt=logText();
+  try{ await navigator.clipboard.writeText(txt); setDbg("log copied ✓ ("+LOG.length+" events)"); }
+  catch(e){ setDbg("copy failed — long-press to select"); }
+});
 </script>
 </body>
 </html>
