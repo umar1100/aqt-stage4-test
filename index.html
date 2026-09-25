@@ -97,8 +97,20 @@ function playLine(name, then){
   logEv("play", {line:name});
   player.src=LINES[name];
   player.onended=()=>{ logEv("play_end", {line:name}); if(then) then(); };
-  player.onerror=()=>{ logEv("play_error", {line:name}); if(then) then(); };
-  player.play().catch(()=>{ logEv("play_error", {line:name}); if(then) then(); });
+  player.onerror=()=>{ logEv("play_error", {line:name, err:"element_error"}); if(then) then(); };
+  const pr=player.play();
+  if(pr && pr.catch) pr.catch(e=>{ logEv("play_error", {line:name, err:(e&&e.name)||"rejected"}); if(then) then(); });
+}
+// iOS Safari only allows audio playback inside a user gesture. Unlock the
+// single Audio element synchronously in the Start tap; later plays then work.
+function unlockAudio(){
+  try{
+    player.src=LINES.greet;
+    const pr=player.play();
+    if(pr && pr.then) pr.then(()=>{ try{player.pause(); player.currentTime=0;}catch(e){} })
+                              .catch(()=>{});
+    logEv("audio_unlock_attempt");
+  }catch(e){ logEv("audio_unlock_error", {err:String(e)}); }
 }
 
 function dbfs(){
@@ -220,6 +232,7 @@ function goListen(which){
   }, LISTEN_TIMEOUT_MS);
 }
 async function start(){
+  unlockAudio();  // must run synchronously inside the tap gesture (iOS)
   $("start").style.display="none";
   logEv("test_start");
   setStatus("Getting the mic ready…");
