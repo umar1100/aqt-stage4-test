@@ -78,12 +78,13 @@ const $=id=>document.getElementById(id);
 const ring=$("ring"), statusEl=$("status"), scoreEl=$("score"), dbg=$("dbg");
 const t0=performance.now();
 const ua=(navigator.userAgent||"").slice(0,80);
+const BUILD="2026-09-25d";
 // ---- diagnostic event log (always copyable, even mid-run) ----
 const LOG=[];
 function logEv(name, data){ LOG.push(Object.assign({t:+((performance.now()-t0)/1000).toFixed(2), ev:name}, data||{})); }
 window.addEventListener("error", e=>{ try{logEv("window_error",{msg:String(e.message||e.error).slice(0,140)});}catch(_){} });
 function logText(){
-  const lines=["AQT CALIBRATION LOG", new Date().toISOString(), "speaker="+speaker, ""];
+  const lines=["AQT CALIBRATION LOG "+BUILD, new Date().toISOString(), "speaker="+speaker, ""];
   for(const e of LOG){
     const rest=Object.keys(e).filter(k=>k!=="t"&&k!=="ev").map(k=>k+"="+e[k]).join(" ");
     lines.push("+"+e.t+"s "+e.ev+(rest?" "+rest:""));
@@ -192,8 +193,10 @@ function skipTrial(){
 }
 async function goListen(){
   const b=cur();
-  // Re-acquire the mic if iOS killed the track mid-run.
+  // iOS can suspend the AudioContext or kill the mic track between trials —
+  // detect and repair both, and record their state for diagnosis.
   try{
+    if(AC.state==="suspended"){ await AC.resume(); logEv("ac_resumed"); }
     const tr=micStream&&micStream.getAudioTracks()[0];
     if(!tr||tr.readyState!=="live"){
       logEv("mic_reacquire");
@@ -201,8 +204,10 @@ async function goListen(){
         echoCancellation:true, noiseSuppression:true, autoGainControl:true}});
       AC.createMediaStreamSource(micStream).connect(analyser);
     }
-  }catch(e){ logEv("mic_reacquire_err",{err:String(e).slice(0,60)}); }
-  logEv("listen_start",{block:blockIdx+1,trial:trialInBlock+1,say:b.say});
+  }catch(e){ logEv("audio_repair_err",{err:String(e).slice(0,60)}); }
+  const trk=micStream&&micStream.getAudioTracks()[0];
+  logEv("listen_start",{block:blockIdx+1,trial:trialInBlock+1,say:b.say,
+    ac:AC.state, track:trk?trk.readyState:"none"});
   mode="listen"; ring.classList.add("glow");
   floorBuf=[]; noiseFloor=null;
   $("skip").style.display="inline-block";
@@ -233,7 +238,7 @@ function copyResults(){
 }
 async function start(){
   speaker=($("speaker").value||"child-1").trim()||"child-1";
-  logEv("test_start",{speaker:speaker});
+  logEv("test_start",{speaker:speaker,build:BUILD});
   $("setup").style.display="none"; ring.style.display="";
   setStatus("Getting the mic ready…");
   try{
